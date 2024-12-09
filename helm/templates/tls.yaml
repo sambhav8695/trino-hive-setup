@@ -1,0 +1,25 @@
+{{- if .Values.tls.enabled }}
+{{- range .Values.tls.data }}
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: {{ .name }}-external-secrets
+  namespace: {{ $.Release.Namespace }}
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    name: {{ $.Values.tls.secretStoreRef.name }}
+    kind: {{ $.Values.tls.secretStoreRef.kind }}
+  target:
+    name: {{ .name }}
+    template:
+      type: kubernetes.io/tls
+  data:
+    - secretKey: tls.crt
+      remoteRef:
+        key: {{ .crt }}
+    - secretKey: tls.key
+      remoteRef:
+        key: {{ .key }}
+{{- end }}
+{{- end }}

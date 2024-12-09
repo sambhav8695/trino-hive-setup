@@ -1,0 +1,374 @@
+externalSecrets:
+  enabled: true
+  name: common-external-secrets
+  refreshInterval: "24h"
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: gcp-secret-manager
+  target:
+    name: common-secrets
+    creationPolicy: Owner
+  data:
+    secretRef:
+      - secretKey: SERVICE_OPTS
+        remoteRefKey: hive-thrift-secret-local
+      - secretKey: gcp-service-account
+        remoteRefKey: gcp-service-account
+
+tls:
+  enabled: true
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: gcp-secret-manager
+  data:
+    - name: trino-tls-secret
+      crt: trino-tls-certificate
+      key: trino-tls-key
+
+hive:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/nil1729/trino-hive-demo
+    pullPolicy: IfNotPresent
+    tag: "hive-master"
+
+  imagePullSecrets: []
+  nameOverride: ""
+  fullnameOverride: "hive-thrift"
+
+  serviceAccount:
+    create: false
+    automount: false
+    annotations: {}
+    name: ""
+
+  configMap:
+    name: hive-thrift-config-map
+    core-site-xml: |
+      <configuration>
+        <property>
+            <name>google.cloud.auth.type</name>
+            <value>SERVICE_ACCOUNT_JSON_KEYFILE</value>
+        </property>
+        <property>
+            <name>google.cloud.auth.service.account.json.keyfile</name>
+            <value>/opt/secrets/gcs-sa.json</value>
+        </property>
+      </configuration>
+
+  volumes:
+    - name: secret-vol
+      secret:
+        secretName: common-secrets
+        optional: false
+        items:
+          - key: gcp-service-account
+            path: gcs-sa.json
+    - name: config-map-vol
+      configMap:
+        name: hive-thrift-config-map
+        items:
+          - key: core-site-xml
+            path: core-site.xml
+
+  volumeMounts:
+    - name: secret-vol
+      mountPath: "/opt/secrets/gcs-sa.json"
+      subPath: gcs-sa.json
+      readOnly: true
+    - name: config-map-vol
+      mountPath: "/opt/hadoop/etc/hadoop/core-site.xml"
+      subPath: core-site.xml
+      readOnly: false
+
+  env:
+    - name: HIVE_AUX_JARS_PATH
+      value: "/opt/hadoop/share/hadoop/tools/lib/*"
+    - name: METASTORE_AUX_JARS_PATH
+      value: "/opt/hadoop/share/hadoop/tools/lib/*"
+    - name: SERVICE_NAME
+      value: "metastore"
+    - name: VERBOSE
+      value: "true"
+    - name: DB_DRIVER
+      value: "postgres"
+    - name: SERVICE_OPTS
+      valueFrom:
+        secretKeyRef:
+          name: common-secrets
+          key: SERVICE_OPTS
+
+  service:
+    type: ClusterIP
+    name: thrift
+    port: 9083
+    targetPort: 9083
+    protocol: TCP
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    tls: []
+
+  livenessProbe:
+    tcpSocket:
+      port: 9083
+    initialDelaySeconds: 30
+    periodSeconds: 60
+    timeoutSeconds: 10
+    failureThreshold: 5
+
+  readinessProbe:
+    tcpSocket:
+      port: 9083
+    initialDelaySeconds: 30
+    periodSeconds: 60
+    timeoutSeconds: 10
+    failureThreshold: 5
+
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 80
+
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  securityContext: {}
+
+trino:
+  enabled: true
+  nameOverride: trino-local
+  coordinatorNameOverride: trino-local-coordinator
+  workerNameOverride: trino-local-worker
+
+  image:
+    registry: ""
+    repository: trinodb/trino
+    tag: "440"
+    digest: ""
+    useRepositoryAsSoleImageReference: false
+    pullPolicy: IfNotPresent
+
+  imagePullSecrets: []
+
+  server:
+    workers: 1
+    node:
+      environment: production
+      dataDir: /data/trino
+      pluginDir: /usr/lib/trino/plugin
+    log:
+      trino:
+        level: INFO
+    config:
+      path: /etc/trino
+      http:
+        port: 8080
+      https:
+        enabled: false
+        port: 8443
+        keystore:
+          path: ""
+      authenticationType: "PASSWORD"
+      query:
+        maxMemory: "4GB"
+    exchangeManager:
+      name: "filesystem"
+      baseDir: "/tmp/trino-local-file-system-exchange-manager"
+    workerExtraConfig: ""
+    coordinatorExtraConfig: ""
+    autoscaling:
+      enabled: false
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 50
+      targetMemoryUtilizationPercentage: 70
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 5
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 15
+          selectPolicy: Max
+
+  accessControl: {}
+  resourceGroups: {}
+  additionalNodeProperties: []
+
+  additionalConfigProperties:
+    - internal-communication.shared-secret=random-value-999
+    - http-server.process-forwarded=true
+
+  additionalLogProperties: []
+  additionalExchangeManagerProperties: []
+  eventListenerProperties: []
+
+  additionalCatalogs:
+    iceberg: |
+      connector.name=iceberg
+      iceberg.catalog.type=hive_metastore
+      hive.metastore.uri=thrift://hive-thrift:9083
+      iceberg.file-format=PARQUET
+      fs.native-gcs.enabled=true
+      gcs.project-id=pwa-demo-nil1729
+      gcs.json-key-file-path=/secrets/gcp-service-account
+      hive.metastore.thrift.client.read-timeout=600s
+      hive.metastore.thrift.client.connect-timeout=120s
+
+  env: []
+  envFrom: []
+  initContainers: {}
+  sidecarContainers: {}
+
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  shareProcessNamespace:
+    coordinator: false
+    worker: false
+
+  service:
+    annotations: {}
+    type: ClusterIP
+    port: 8080
+    nodePort: ""
+
+  auth:
+    passwordAuth: |
+      admin:$2y$10$TaIpQC.dnjGzoxiYYMuS/uQqSBEYJ4H3n4s4Rq8da7bVCBrdox.fW
+
+  serviceAccount:
+    create: false
+    name: ""
+    annotations: {}
+
+  configMounts: []
+  secretMounts:
+    - name: common-secrets
+      secretName: common-secrets
+      path: /secrets
+
+  coordinator:
+    jvm:
+      maxHeapSize: "8G"
+      gcMethod:
+        type: "UseG1GC"
+        g1:
+          heapRegionSize: "32M"
+
+    config:
+      memory:
+        heapHeadroomPerNode: ""
+      query:
+        maxMemoryPerNode: "1GB"
+
+    additionalJVMConfig: []
+    additionalExposedPorts: {}
+    resources: {}
+    livenessProbe: {}
+    readinessProbe: {}
+    lifecycle: {}
+    terminationGracePeriodSeconds: 30
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    additionalConfigFiles: {}
+    additionalVolumes: []
+    additionalVolumeMounts: []
+    annotations: {}
+    labels: {}
+    configMounts: []
+    secretMounts: []
+
+  worker:
+    jvm:
+      maxHeapSize: "8G"
+      gcMethod:
+        type: "UseG1GC"
+        g1:
+          heapRegionSize: "32M"
+
+    config:
+      memory:
+        heapHeadroomPerNode: ""
+      query:
+        maxMemoryPerNode: "1GB"
+
+    additionalJVMConfig: []
+    additionalExposedPorts: {}
+    resources: {}
+    livenessProbe: {}
+    readinessProbe: {}
+    lifecycle: {}
+    terminationGracePeriodSeconds: 30
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    additionalConfigFiles: {}
+    additionalVolumes: []
+    additionalVolumeMounts: []
+    annotations: {}
+    labels: {}
+    configMounts: []
+    secretMounts: []
+
+  kafka:
+    mountPath: "/etc/trino/schemas"
+    tableDescriptions: {}
+
+  jmx:
+    enabled: false
+    registryPort: 9080
+    serverPort: 9081
+    exporter:
+      enabled: false
+      image: bitnami/jmx-exporter:latest
+      pullPolicy: Always
+      port: 5556
+      configProperties: []
+      securityContext: {}
+      resources: {}
+
+  serviceMonitor:
+    enabled: false
+    labels:
+      prometheus: kube-prometheus
+    interval: "30s"
+
+  commonLabels: {}
+
+  ingress:
+    enabled: true
+    className: "contour"
+    annotations: {}
+    hosts:
+      - host: trino.k8s.test.nilanjandeb.com
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+    tls:
+      - secretName: trino-tls-secret
+        hosts:
+          - trino.k8s.test.nilanjandeb.com

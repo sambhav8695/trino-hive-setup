@@ -1,0 +1,261 @@
+services:
+  hive-metastore-db:
+    container_name: hive-metastore-db
+    hostname: hive-metastore-db
+    image: mysql:latest
+    environment:
+      MYSQL_ROOT_PASSWORD: ${HIVE_METASTORE_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${HIVE_METASTORE_DB_NAME}
+      MYSQL_USER: ${HIVE_METASTORE_DB_USER}
+      MYSQL_PASSWORD: ${HIVE_METASTORE_DB_PASSWORD}
+    volumes:
+      - hive-metastore-db-data:/var/lib/mysql
+    networks:
+      internal:
+        ipv4_address: ${HIVE_METASTORE_DB_IP}
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+      interval: 10s
+      retries: 5
+      timeout: 5s
+    profiles: [hive]
+
+  hive-server:
+    container_name: hive-server
+    hostname: hive-server
+    image: ${HIVE_IMAGE}
+    pull_policy: always
+    # build:
+    #   context: ./hive
+    #   dockerfile: Dockerfile
+    #   args:
+    #     - HIVE_VERSION=${HIVE_VERSION}
+    #     - HADOOP_VERSION=${HADOOP_VERSION}
+    depends_on:
+      hive-metastore-db:
+        condition: service_healthy
+    environment:
+      - HADOOP_HOME=/opt/hadoop
+      - HIVE_HOME=/opt/hive
+    volumes:
+      - ./secrets/gcp-sa.json:/opt/gcp/secrets/service-account.json
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml
+      - ./hive/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+    networks:
+      internal:
+        ipv4_address: ${HIVE_SERVER_IP}
+    healthcheck:
+      test: ['CMD-SHELL', 'nc -zv localhost 9083 || exit 1']
+      interval: 10s
+      retries: 5
+      timeout: 5s
+    profiles: [hive]
+
+  trino-event-db:
+    container_name: trino-event-db
+    hostname: trino-event-db
+    image: mysql:latest
+    environment:
+      MYSQL_ROOT_PASSWORD: ${TRINO_EVENT_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${TRINO_EVENT_DB_NAME}
+      MYSQL_USER: ${TRINO_EVENT_DB_USER}
+      MYSQL_PASSWORD: ${TRINO_EVENT_DB_PASSWORD}
+    volumes:
+      - trino-event-db-data:/var/lib/mysql
+    networks:
+      internal:
+        ipv4_address: ${TRINO_EVENT_DB_IP}
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+      interval: 10s
+      retries: 5
+      timeout: 5s
+    profiles: [trino]
+
+  trino-cache-fs-init:
+    image: alpine:3.19.2
+    hostname: trino-cache-fs-init
+    container_name: trino-cache-fs-init
+    user: root
+    volumes:
+      - trino-cache-fs-1:/tmp/trino-cache/1
+      - trino-cache-fs-2:/tmp/trino-cache/2
+    networks:
+      - internal
+    profiles: [trino]
+    command: >
+      sh -c '
+        set -eux;
+
+        apk add --no-cache shadow;
+
+        [ ! -d /tmp/trino-cache/1/iceberg ] && mkdir -p /tmp/trino-cache/1/iceberg;
+        [ ! -d /tmp/trino-cache/2/iceberg ] && mkdir -p /tmp/trino-cache/2/iceberg;
+
+        if ! id -u trino > /dev/null 2>&1; then
+          adduser -D trino;
+        fi;
+
+        id trino;
+
+        chown -R trino /tmp/trino-cache/1;
+        chown -R trino /tmp/trino-cache/2;
+
+        chmod -R u+w /tmp/trino-cache/1;
+        chmod -R u+w /tmp/trino-cache/1;
+
+        echo "user [trino] has been created, and the ownership and permissions for cache directory have been updated"
+        exit 0;
+      '
+
+  trino-coordinator:
+    hostname: trino-coordinator
+    container_name: trino-coordinator
+    image: ${TRINO_IMAGE}
+    pull_policy: always
+    # build:
+    #   context: ./trino
+    #   dockerfile: Dockerfile
+    ports:
+      - '8080:8080'
+      - '9080:9080'
+      - '9081:9081'
+      - '12345:12345'
+    volumes:
+      - ./trino/coordinator/config.properties:/etc/trino/config.properties
+      - ./trino/coordinator/jvm.config:/etc/trino/jvm.config
+      - ./trino/coordinator/jmx-config.yaml:/etc/trino/jmx/config.yaml
+      - ./trino/coordinator/mysql-event-listener.properties:/etc/trino/mysql-event-listener.properties
+      - ./secrets/gcp-sa.json:/opt/gcp/secrets/service-account.json
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/common/exchange-manager.properties:/etc/trino/exchange-manager.properties
+
+      # file system caching (alluxio)
+      - trino-cache-fs-1:/tmp/trino-cache/1
+      - trino-cache-fs-2:/tmp/trino-cache/2
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    depends_on:
+      trino-event-db:
+        condition: service_healthy
+      hive-server:
+        condition: service_healthy
+      trino-cache-fs-init:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8080/v1/info']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    profiles: [trino]
+
+  trino-worker:
+    image: ${TRINO_IMAGE}
+    pull_policy: always
+    # build:
+    #   context: ./trino
+    #   dockerfile: Dockerfile
+    volumes:
+      - ./trino/worker/config.properties:/etc/trino/config.properties
+      - ./secrets/gcp-sa.json:/opt/gcp/secrets/service-account.json
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/common/exchange-manager.properties:/etc/trino/exchange-manager.properties
+            
+      # file system caching (alluxio)
+      - trino-cache-fs-1:/tmp/trino-cache/1
+      - trino-cache-fs-2:/tmp/trino-cache/2
+    depends_on:
+      trino-cache-fs-init:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    networks:
+      - internal
+    profiles: [trino]
+
+  superser-backend-db:
+    container_name: superser-backend-db
+    hostname: superser-backend-db
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: ${SUPERSET_BACKEND_DB_USER}
+      POSTGRES_PASSWORD: ${SUPERSET_BACKEND_DB_PASSWORD}
+      POSTGRES_DB: ${SUPERSET_BACKEND_DB_NAME}
+    volumes:
+      - superser-backend-db-data:/var/lib/postgresql/data
+    networks:
+      internal:
+        ipv4_address: ${SUPERSET_BACKEND_DB_IP}
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', '${SUPERSET_BACKEND_DB_USER}']
+      interval: 10s
+      retries: 5
+      timeout: 5s
+    profiles: [superset]
+
+  superset:
+    container_name: superset
+    hostname: superset
+    image: ${SUPERSET_IMAGE}
+    pull_policy: always
+    # build:
+    #   context: ./superset
+    #   dockerfile: Dockerfile
+    depends_on:
+      superser-backend-db:
+        condition: service_healthy
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - SUPERSET_CONFIG_PATH=/app/superset_config.py
+    volumes:
+      - ./superset/superset_config.py:/app/superset_config.py
+    ports:
+      - '8088:8088'
+    networks:
+      - www
+      - internal
+    profiles: [superset]
+
+  superset-init:
+    container_name: superset-init
+    hostname: superset-init
+    image: ${SUPERSET_IMAGE}
+    pull_policy: always
+    # build:
+    #   context: ./superset
+    #   dockerfile: Dockerfile
+    command: ' /opt/bin/docker-init.sh'
+    depends_on:
+      superser-backend-db:
+        condition: service_healthy
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - SUPERSET_CONFIG_PATH=/app/superset_config.py
+    volumes:
+      - ./superset/superset_config.py:/app/superset_config.py
+    networks:
+      - internal
+    profiles: [superset]
+
+volumes:
+  trino-event-db-data:
+  hive-metastore-db-data:
+  superser-backend-db-data:
+  trino-cache-fs-1:
+  trino-cache-fs-2:
+
+networks:
+  internal:
+    ipam:
+      driver: default
+      config:
+        - subnet: ${INTERNAL_SUBNET}
+  www:

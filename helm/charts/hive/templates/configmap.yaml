@@ -1,0 +1,12 @@
+{{- if .Values.configMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name:  {{ .Values.configMap.name }}
+  labels:
+    {{- include "hive.labels" . | nindent 4 }}
+data:
+  {{- with .Values.configMap }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}
